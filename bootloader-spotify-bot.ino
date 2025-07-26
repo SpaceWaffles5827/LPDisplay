@@ -36,7 +36,7 @@ const int   OAUTH_PORT   = 443;
 // OTA metadata URL
 const char* OTA_JSON_URL = "https://oauth.thespacewaffles.com/updates/ota.json";
 
-const char* LOCAL_FIRMWARE_VERSION = "0.0.0";
+const char* LOCAL_FIRMWARE_VERSION = "1.0.0";
 
 // Current firmware version for self-check after OTA
 
@@ -52,6 +52,11 @@ String DEVICE_ID;
 String ACCESS_TOKEN  = "";
 String REFRESH_TOKEN = "";
 String latestHtml    = "";
+
+// ── new for smooth bar ──
+int currentProgressMs         = 0;
+int trackDurationMs           = 1;
+unsigned long lastProgressUpdateMillis = 0;
 
 // Wi‑Fi state
 enum WifiState { CONNECTING, CONNECTED, DISCONNECTED };
@@ -105,6 +110,22 @@ void displayWrappedText(int x, int &y, const String &text) {
   }
 }
 
+// ── draws the bottom progress bar ──
+void drawProgressBar() {
+  const int barH = 5;
+  const int barY = SCREEN_HEIGHT - barH;
+
+  // only clear the inside of the bar (leave the border intact)
+  display.fillRect(1, barY+1, SCREEN_WIDTH-2, barH-2, SSD1306_BLACK);
+
+  // draw the fill
+  int w = map(currentProgressMs, 0, trackDurationMs, 0, SCREEN_WIDTH-2);
+  display.fillRect(1, barY+1, w, barH-2, SSD1306_WHITE);
+
+  // update the display once
+  display.display();
+}
+
 // ————————— OAuth helpers —————————
 
 void unlinkFromServer() {
@@ -149,7 +170,13 @@ bool pollForTokens() {
   JsonObject tok = doc["tokens"].as<JsonObject>();
   ACCESS_TOKEN  = tok["access_token"].as<String>();
   REFRESH_TOKEN = tok["refresh_token"].as<String>();
-  Serial.println("✅ tokens received");
+
+  prefs.begin("oauth", false);
+  prefs.putString("access_token", ACCESS_TOKEN);
+  prefs.putString("refresh_token", REFRESH_TOKEN);
+  prefs.end();
+
+  Serial.println("✅ tokens received and stored");
   return true;
 }
 
@@ -185,7 +212,13 @@ bool refreshAccessToken() {
   ACCESS_TOKEN = tok["access_token"].as<String>();
   if (tok.containsKey("refresh_token"))
     REFRESH_TOKEN = tok["refresh_token"].as<String>();
-  Serial.println("✅ token refreshed");
+
+  prefs.begin("oauth", false);
+  prefs.putString("access_token", ACCESS_TOKEN);
+  prefs.putString("refresh_token", REFRESH_TOKEN);
+  prefs.end();
+
+  Serial.println("✅ token refreshed and stored");
   return true;
 }
 
@@ -294,8 +327,38 @@ bool checkForOTA() {
   return true;
 }
 
-// ————————— Fetch & Draw song —————————
+void drawTrackInfo(const char* song, const char* artist) {
+  // height of the progress bar region
+  const int barH = 5;
 
+  // 1) clear only the top (text) area, leave bottom bar intact
+  display.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT - barH, SSD1306_BLACK);
+
+  // 2) set up your text parameters once
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(true);
+
+  // 3) draw your lines of text
+  int y = 0;
+  display.setCursor(0, y);
+  display.println("Now Playing:");
+  y += LINE_HEIGHT;
+
+  displayWrappedText(0, y, String(song));
+  displayWrappedText(0, y, String("by ") + artist);
+
+  display.setCursor(0, y);
+  display.println(String("Hello ") + USER_NAME);
+
+  // 4) draw the static progress‑bar border once
+  display.drawRect(0, SCREEN_HEIGHT - barH, SCREEN_WIDTH, barH, SSD1306_WHITE);
+
+  // 5) push the full buffer in one go
+  display.display();
+}
+
+// ————————— Fetch & Draw song —————————
 String fetchCurrentSpotifySong() {
   Serial.println("🎵 fetchCurrentSpotifySong()");
   if (ACCESS_TOKEN == "") {
@@ -359,24 +422,16 @@ String fetchCurrentSpotifySong() {
   int progressMs     = doc["progress_ms"]               | 0;
   Serial.printf("▶️ Now Playing: %s by %s\n", song, artist);
 
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextWrap(true);
+  int durationMs = doc["item"]["duration_ms"] | 1;   // total track length
 
-  int y = 0;
-  display.setCursor(0, y);
-  display.println("Now Playing:");
-  y += LINE_HEIGHT;
+  // draw static info once per new track
+  drawTrackInfo(song, artist);
 
-  displayWrappedText(0, y, String(song));
-  displayWrappedText(0, y, String("by ") + artist);
+  // initialize smooth‑bar timing
+  trackDurationMs         = durationMs;
+  currentProgressMs       = progressMs;
+  lastProgressUpdateMillis = millis();
 
-  display.setCursor(0, y);
-  display.println(String("Hello ") + USER_NAME);
-  y += LINE_HEIGHT;
-
-  display.display();
 
   String html = "<h1>Now Playing</h1>";
   html += "<p><b>" + String(song) + "</b> by " + artist + "</p>";
@@ -446,6 +501,24 @@ void setup() {
 
   Serial.printf("✅ IP: %s\n", WiFi.localIP().toString().c_str());
 
+  // ——— load & refresh saved OAuth tokens now that Wi‑Fi is up ———
+  prefs.begin("oauth", false);
+  ACCESS_TOKEN  = prefs.getString("access_token", "");
+  REFRESH_TOKEN = prefs.getString("refresh_token", "");
+  prefs.end();
+
+  if (REFRESH_TOKEN != "") {
+    Serial.println("🔓 Found saved refresh token, trying silent login");
+    if (refreshAccessToken()) {
+      latestHtml = fetchCurrentSpotifySong();
+    } else {
+      prefs.begin("oauth", false);
+      prefs.clear();
+      prefs.end();
+      Serial.println("❌ Refresh failed, will re‑pair");
+    }
+  }
+
   // mDNS
   if (MDNS.begin("esp32")) {
     Serial.println("✅ mDNS responder started");
@@ -491,13 +564,15 @@ void setup() {
   server.begin();
   Serial.println("✅ HTTP server started");
 
-  // wait for OAuth
-  while (!pollForTokens()) {
-    server.handleClient();
-    delay(2000);
+  // only pair if we still don’t have an access token
+  if (ACCESS_TOKEN == "") {
+    while (!pollForTokens()) {
+      server.handleClient();
+      delay(2000);
+    }
+    latestHtml = fetchCurrentSpotifySong();
+    lastPollTime = millis();
   }
-  latestHtml = fetchCurrentSpotifySong();
-  lastPollTime = millis();
 }
 
 void loop() {
@@ -524,6 +599,19 @@ void loop() {
 
   // serve web
   server.handleClient();
+
+  // ── smooth-progress update ──
+  if (ACCESS_TOKEN != "") {
+    unsigned long now = millis();
+    unsigned long delta = now - lastProgressUpdateMillis;
+    if (currentProgressMs + delta < trackDurationMs) {
+      currentProgressMs += delta;
+      lastProgressUpdateMillis = now;
+    } else {
+      currentProgressMs = trackDurationMs;
+    }
+    drawProgressBar();
+  }
 
   // periodic Spotify poll
   unsigned long now = millis();
