@@ -1,0 +1,3 @@
+[] Move this into propper PlatformIO project structure.
+[] Add library dependencies for audio processing and networking.
+[] Add worldveil/dejavu music ID stuff
